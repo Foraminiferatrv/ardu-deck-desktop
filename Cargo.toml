@@ -1,0 +1,10 @@
+[package]
+name = "ardu-deck-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ascii = "1.1.0"
+serde = "1.0.229"
+serial2 = "0.2.37"
+zerocopy = {version="0.9.0-alpha.0", features = ["derive"]}
