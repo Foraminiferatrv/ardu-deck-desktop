@@ -146,53 +146,36 @@ fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::S
 
                 if first == b'B' {
                     if second == b'3' {
-                        // println!("Before lock: {:?}", state_mutex.is_poisoned());
                         let mut state = state.lock().unwrap();
-                        //
                         if fourth == b'1' {
                             println!("IT'S A MICROPHONE BUTTON: ON");
-                            // let mut state = state_mutex.lock().expect("Error locking mutex read");
                             state.set_is_micro_on(true);
-
-                            // tx.send(State {
-                            //     is_micro_on: true,
-                            //     followers: 25,
-                            //     is_live: true,
-                            //     viewers: 213,
-                            // })
-                            // .unwrap();
-                            // state.is_micro_on = true;
-                            // *state = State {
-                            //     is_micro_on: true,
-                            //     followers: state.followers,
-                            //     is_live: state.is_live,
-                            //     viewers: state.viewers,
-                            // };
                         } else if fourth == b'0' {
                             println!("IT'S A MICROPHONE BUTTON: off");
-                            // let mut state = state_mutex.lock().expect("Error locking mutex read");
 
                             state.set_is_micro_on(false);
-
-                            // tx.send(State {
-                            //     is_micro_on: false,
-                            //     followers: 25,
-                            //     is_live: true,
-                            //     viewers: 213,
-                            // })
-                            // .unwrap();
-                            // state.is_micro_on = false;
-
-                            // *state = State {
-                            //     is_micro_on: false,
-                            //     followers: state.followers,
-                            //     is_live: state.is_live,
-                            //     viewers: state.viewers,
-                            // };
                         }
-                        // println!("Guard: {:?}", state);
+                        tx.send(true).unwrap();
                     }
-                    tx.send(true).unwrap();
+
+                    if second == b'4' {
+                        println!("MACRO 4")
+                    }
+                    if second == b'5' {
+                        println!("MACRO 5")
+                    }
+                    if second == b'6' {
+                        println!("MACRO 6")
+                    }
+                    if second == b'7' {
+                        println!("MACRO 7")
+                    }
+                    if second == b'8' {
+                        println!("MACRO 8")
+                    }
+                    if second == b'9' {
+                        println!("MACRO 9")
+                    }
                 }
             };
             thread::sleep(time::Duration::from_millis(60));
@@ -215,7 +198,7 @@ fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>) {
         port.write(byte.as_bytes()).expect("Error writing bytes");
         // port.flush().unwrap();
 
-        thread::sleep(time::Duration::from_millis(20));
+        thread::sleep(time::Duration::from_millis(20)); // Delay in write: 20 x 14 = 280ms
         // thread::sleep(time::Duration::from_millis(30));
     }
     // }
@@ -266,7 +249,8 @@ fn do_main() -> Result<(), ()> {
     });
 
     loop {
-        println!("Write thread");
+        // println!("Write thread");
+
         let res = match rx.try_recv() {
             Ok(val) => val,
             Err(_) => false,
