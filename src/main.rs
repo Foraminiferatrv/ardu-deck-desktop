@@ -2,20 +2,14 @@ extern crate core;
 
 const BAUDRATE: u32 = 115200;
 
-use ascii::{AsAsciiStr, ToAsciiChar};
 use core::time;
 use serial2::SerialPort;
-use std::io::{IoSlice, Read, Write};
-use std::ops::Deref;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::mpsc::Sender;
 
 use std::sync::mpsc;
-// use tokio;
-// use tokio::time::sleep;
-use zerocopy::{FromBytes, IntoBytes, Usize};
+use zerocopy::IntoBytes;
 
 #[derive(Clone, Copy, Debug)]
 struct State {
@@ -23,8 +17,6 @@ struct State {
     is_live: bool,
     viewers: i32,
     followers: i32,
-    // port: Arc<SerialPort>,
-    // port: &'a Arc<SerialPort>,
 }
 
 impl State {
@@ -34,14 +26,10 @@ impl State {
     //         is_micro_on: false,
     //         followers: 0,
     //         viewers: 0,
-    //         port,
     //     }
     // }
 
     fn new() -> State {
-        // let mut port = SerialPort::open("COM3", BAUDRATE).unwrap();
-        // port.set_read_timeout(Duration::new(0, 0)).unwrap();
-
         State {
             is_live: false,
             is_micro_on: false,
@@ -52,37 +40,16 @@ impl State {
 
     fn set_is_micro_on(&mut self, new_value: bool) {
         self.is_micro_on = new_value;
-        // Self::on_change(self);
     }
     fn set_is_live(&mut self, new_value: bool) {
         self.is_live = new_value;
-        // Self::on_change(self);
     }
     fn set_viewers(&mut self, new_value: i32) {
         self.viewers = new_value;
-        // Self::on_change(self);
     }
     fn set_followers(&mut self, new_value: i32) {
         self.followers = new_value;
-        // Self::on_change(self);
     }
-
-    // fn write_state_to_deck(&self) {
-    //     let message = self.serialize();
-
-    //     for byte in message {
-    //         println!("Write: {}", byte);
-    //         self.port.write(byte.as_bytes()).expect("Error writing bytes");
-    //         self.port.flush().unwrap();
-
-    //         thread::sleep(time::Duration::from_millis(30));
-    //     }
-    // }
-
-    // fn on_change(&self) {
-    //     println!("Change!");
-    //     self.write_state_to_deck();
-    // }
 
     fn serialize(&self) -> Vec<u8> {
         let mut message: Vec<&[u8]> = vec![b"*"];
@@ -131,18 +98,18 @@ fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::S
             let read = port.read(&mut read_buffer).unwrap_or_else(|_e| 0);
 
             if read != 0 {
-                println!("Read from deck: {:?}", read_buffer);
-                println!("Buff {:?}", read_buffer.as_ascii_str().unwrap());
+                // println!("Read from deck: {:?}", read_buffer);
+                // println!("Buff {:?}", read_buffer.as_ascii_str().unwrap());
 
-                let [first, second, third, fourth, ..] = read_buffer;
+                let [first, second, _third, fourth, ..] = read_buffer;
 
-                println!(
-                    "first: {:?}, second: {:?}, third: {:?}, fourth: {:?}",
-                    first.to_ascii_char().unwrap(),
-                    second.to_ascii_char().unwrap(),
-                    third.to_ascii_char().unwrap(),
-                    fourth.to_ascii_char().unwrap()
-                );
+                // println!(
+                //     "first: {:?}, second: {:?}, third: {:?}, fourth: {:?}",
+                //     first.to_ascii_char().unwrap(),
+                //     second.to_ascii_char().unwrap(),
+                //     third.to_ascii_char().unwrap(),
+                //     fourth.to_ascii_char().unwrap()
+                // );
 
                 if first == b'B' {
                     if second == b'3' {
@@ -196,7 +163,8 @@ fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>) {
     for byte in message {
         println!("Write: {}", byte);
         port.write(byte.as_bytes()).expect("Error writing bytes");
-        // port.flush().unwrap();
+        // port.write_all(byte.as_bytes()).expect("Error writing bytes");
+        port.flush().unwrap();
 
         thread::sleep(time::Duration::from_millis(20)); // Delay in write: 20 x 14 = 280ms
         // thread::sleep(time::Duration::from_millis(30));
