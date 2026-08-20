@@ -7,20 +7,41 @@ use core::time;
 use serial2::SerialPort;
 use std::io::{IoSlice, Read, Write};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc::Sender;
+
+use std::sync::mpsc;
+// use tokio;
+// use tokio::time::sleep;
 use zerocopy::{FromBytes, IntoBytes, Usize};
 
+#[derive(Clone, Copy, Debug)]
 struct State {
     is_micro_on: bool,
     is_live: bool,
     viewers: i32,
     followers: i32,
+    // port: Arc<SerialPort>,
+    // port: &'a Arc<SerialPort>,
 }
 
 impl State {
-    fn default() -> State {
+    // fn default() -> State {
+    //     State {
+    //         is_live: false,
+    //         is_micro_on: false,
+    //         followers: 0,
+    //         viewers: 0,
+    //         port,
+    //     }
+    // }
+
+    fn new() -> State {
+        // let mut port = SerialPort::open("COM3", BAUDRATE).unwrap();
+        // port.set_read_timeout(Duration::new(0, 0)).unwrap();
+
         State {
             is_live: false,
             is_micro_on: false,
@@ -28,128 +49,202 @@ impl State {
             viewers: 0,
         }
     }
+
+    fn set_is_micro_on(&mut self, new_value: bool) {
+        self.is_micro_on = new_value;
+        // Self::on_change(self);
+    }
+    fn set_is_live(&mut self, new_value: bool) {
+        self.is_live = new_value;
+        // Self::on_change(self);
+    }
+    fn set_viewers(&mut self, new_value: i32) {
+        self.viewers = new_value;
+        // Self::on_change(self);
+    }
+    fn set_followers(&mut self, new_value: i32) {
+        self.followers = new_value;
+        // Self::on_change(self);
+    }
+
+    // fn write_state_to_deck(&self) {
+    //     let message = self.serialize();
+
+    //     for byte in message {
+    //         println!("Write: {}", byte);
+    //         self.port.write(byte.as_bytes()).expect("Error writing bytes");
+    //         self.port.flush().unwrap();
+
+    //         thread::sleep(time::Duration::from_millis(30));
+    //     }
+    // }
+
+    // fn on_change(&self) {
+    //     println!("Change!");
+    //     self.write_state_to_deck();
+    // }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut message: Vec<&[u8]> = vec![b"*"];
+        let viewers = format!("V{:0>3}", self.viewers.to_string());
+        let followers = format!("F{:0>3}", self.followers.to_string());
+
+        //Micro serialize
+        if self.is_micro_on {
+            message.push(b"M1");
+        } else {
+            message.push(b"M0");
+        }
+
+        //Live serialize
+        if self.is_live {
+            message.push(b"L1");
+        } else {
+            message.push(b"L0");
+        }
+
+        //Viewers serialize
+        message.push(viewers.as_bytes());
+
+        //Followers serialize
+        message.push(followers.as_bytes());
+
+        message.push(b"$");
+
+        message.concat()
+    }
 }
 
-// static STATE: Arc<Mutex<State>> = Arc::new(Mutex::new(State {
-//     is_live: false,
-//     is_micro_on: false,
-//     followers: 0,
-//     viewers: 0,
-// }));
-
-fn read_deck(state: Arc<State>, port: Arc<SerialPort>) -> Result<(), ()> {
+fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::Sender<bool>) {
     let mut read_buffer = [0; 8];
-    let mut state = state.clone();
+    // let port = Arc::clone(&state.port);
+
     loop {
+        println!("Read thread");
         // match read_buffer {
         //     [first, second, third, ..] => {
         //         println!("first {:#?}", first);
         //     }
         // };
-        let read = port.read(&mut read_buffer).unwrap_or_else(|_e| 0);
+        {
+            let port = port.lock().unwrap();
+            let read = port.read(&mut read_buffer).unwrap_or_else(|_e| 0);
 
-        if read != 0 {
-            println!("Read from deck: {:?}", read_buffer);
-            println!("Buff {:?}", read_buffer.as_ascii_str().unwrap());
+            if read != 0 {
+                println!("Read from deck: {:?}", read_buffer);
+                println!("Buff {:?}", read_buffer.as_ascii_str().unwrap());
 
-            let [first, second, third, fourth, ..] = read_buffer;
-            println!(
-                "first: {:?}, second: {:?}, third: {:?}, fourth: {:?}",
-                first.to_ascii_char().unwrap(),
-                second.to_ascii_char().unwrap(),
-                third.to_ascii_char().unwrap(),
-                fourth.to_ascii_char().unwrap()
-            );
+                let [first, second, third, fourth, ..] = read_buffer;
 
-            if first == b'B' {
-                if second == b'3' {
-                    if fourth == b'1' {
-                        println!("IT'S A MICROPHONE BUTTON: ON");
-                        state.is_micro_on = true;
-                    } else if fourth == b'0' {
-                        println!("IT'S A MICROPHONE BUTTON: off");
-                        state.is_micro_on = false;
+                println!(
+                    "first: {:?}, second: {:?}, third: {:?}, fourth: {:?}",
+                    first.to_ascii_char().unwrap(),
+                    second.to_ascii_char().unwrap(),
+                    third.to_ascii_char().unwrap(),
+                    fourth.to_ascii_char().unwrap()
+                );
+
+                if first == b'B' {
+                    if second == b'3' {
+                        // println!("Before lock: {:?}", state_mutex.is_poisoned());
+                        let mut state = state.lock().unwrap();
+                        //
+                        if fourth == b'1' {
+                            println!("IT'S A MICROPHONE BUTTON: ON");
+                            // let mut state = state_mutex.lock().expect("Error locking mutex read");
+                            state.set_is_micro_on(true);
+
+                            // tx.send(State {
+                            //     is_micro_on: true,
+                            //     followers: 25,
+                            //     is_live: true,
+                            //     viewers: 213,
+                            // })
+                            // .unwrap();
+                            // state.is_micro_on = true;
+                            // *state = State {
+                            //     is_micro_on: true,
+                            //     followers: state.followers,
+                            //     is_live: state.is_live,
+                            //     viewers: state.viewers,
+                            // };
+                        } else if fourth == b'0' {
+                            println!("IT'S A MICROPHONE BUTTON: off");
+                            // let mut state = state_mutex.lock().expect("Error locking mutex read");
+
+                            state.set_is_micro_on(false);
+
+                            // tx.send(State {
+                            //     is_micro_on: false,
+                            //     followers: 25,
+                            //     is_live: true,
+                            //     viewers: 213,
+                            // })
+                            // .unwrap();
+                            // state.is_micro_on = false;
+
+                            // *state = State {
+                            //     is_micro_on: false,
+                            //     followers: state.followers,
+                            //     is_live: state.is_live,
+                            //     viewers: state.viewers,
+                            // };
+                        }
+                        // println!("Guard: {:?}", state);
                     }
+                    tx.send(true).unwrap();
                 }
-            }
-        };
-        thread::sleep(time::Duration::from_millis(60));
+            };
+            thread::sleep(time::Duration::from_millis(60));
+        }
     }
 }
 
 //1.Serialize state
 //2. Listen to state chagne
+fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>) {
+    // let message = b"*M1L1V204F001$";
 
-fn serialize_state<'a>(state: &'a State) -> Vec<u8> {
-    // let state_lock = STATE.clone();
+    let state = state.lock().unwrap();
+    let message = state.serialize();
+    let port = port.lock().unwrap();
 
-    // let state = state_lock.lock().unwrap();
+    // println!("Message: {:?}", message);
+    for byte in message {
+        println!("Write: {}", byte);
+        port.write(byte.as_bytes()).expect("Error writing bytes");
+        // port.flush().unwrap();
 
-    let mut message: Vec<&[u8]> = vec![b"*"];
-    let viewers = format!("V{:0>3}", state.viewers.to_string());
-    let followers = format!("F{:0>3}", state.followers.to_string());
-
-    //Micro serialize
-    if state.is_micro_on {
-        message.push(b"M1");
-    } else {
-        message.push(b"M0");
+        thread::sleep(time::Duration::from_millis(20));
+        // thread::sleep(time::Duration::from_millis(30));
     }
-
-    //Live serialize
-    if state.is_live {
-        message.push(b"L1");
-    } else {
-        message.push(b"L0");
-    }
-
-    //Viewers serialize
-    message.push(viewers.as_bytes());
-
-    //Followers serialize
-    message.push(followers.as_bytes());
-
-    message.push(b"$");
-
-    message.concat()
-}
-
-fn write_deck(state: &State, port: Arc<SerialPort>) -> Result<(), ()> {
-    // let MESSAGE = b"*M1L1V204F001$";
-    // let MESSAGE_2 = b"*M0L0V000F111$";
-    let mut swi = false;
-
-    loop {
-        let message = serialize_state(state);
-        // let message = message_vec;
-
-        // println!("WRITE THREAD: {:?}", message);
-        for byte in message {
-            // println!("writing: {:?}", byte);
-
-            port.write(byte.as_bytes()).unwrap();
-            port.flush().unwrap();
-
-            thread::sleep(time::Duration::from_millis(30));
-            // thread::sleep(time::Duration::from_millis(400));
-        }
-
-        swi = !swi;
-    }
+    // }
+    // thread::sleep(time::Duration::from_millis(2000));
+    // }
 }
 
 fn do_main() -> Result<(), ()> {
-    let mut port = SerialPort::open("COM3", BAUDRATE).unwrap();
-    port.set_read_timeout(Duration::new(0, 0)).unwrap();
+    let mut raw_port = SerialPort::open("COM3", BAUDRATE).unwrap();
+    raw_port.set_read_timeout(Duration::new(0, 0)).unwrap();
 
-    let mut state = Arc::new(State {
-        is_micro_on: true,
-        is_live: true,
-        viewers: 20,
-        followers: 321,
-    });
+    let port: Arc<Mutex<SerialPort>> = Arc::new(Mutex::new(raw_port));
+    // SerialPort::
 
-    let mut read_state = state.clone();
+    // let port: Arc<SerialPort> = Arc::new(port);
+
+    let (tx, rx) = mpsc::channel::<bool>();
+
+    let state = Arc::new(Mutex::new(State::new()));
+    // let port = state.port;
+
+    // let state = Arc::new(Mutex::new(State {
+    //     is_micro_on: true,
+    //     is_live: true,
+    //     viewers: 20,
+    //     followers: 321,
+    // }));
+
+    // let write_state = state.clone();
     // state = State {
     //     is_micro_on: true,
     //     is_live: true,
@@ -157,20 +252,45 @@ fn do_main() -> Result<(), ()> {
     //     followers: 321,
     // };
 
-    let port: Arc<SerialPort> = Arc::new(port);
+    // let writer_port = port.clone();
 
-    let reader_port = port.clone();
+    // let reader_handle = tokio::spawn(async move { read_deck(read_state, reader_port).await });
+    // let writer_handle = tokio::spawn(async move { write_deck(write_state, writer_port).await });
 
-    println!("Spawning read thread:");
-    let reader_handle = thread::spawn(move || read_deck(read_state, reader_port));
+    let reader_handle = thread::spawn({
+        let reader_state = Arc::clone(&state);
+        let reader_port = Arc::clone(&port);
+        let reader_tx = tx.clone();
 
-    let _res = write_deck(&state, port);
+        move || read_deck(reader_state, reader_port, reader_tx)
+    });
 
-    let _res = reader_handle.join().unwrap();
+    loop {
+        println!("Write thread");
+        let res = match rx.try_recv() {
+            Ok(val) => val,
+            Err(_) => false,
+        };
 
-    Ok(())
+        if res {
+            let writer_state = Arc::clone(&state);
+            let writer_port = Arc::clone(&port);
+
+            write_deck(writer_state, writer_port);
+            tx.send(false).unwrap();
+        }
+    }
+
+    // let _res = ;
+
+    // let _res = reader_handle.join().unwrap();
+    //
+    // tokio::join!(reader_handle);
+
+    // Ok(())
 }
 
+// #[tokio::main]
 fn main() {
     if let Err(()) = do_main() {
         std::process::exit(1);
