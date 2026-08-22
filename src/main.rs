@@ -11,6 +11,16 @@ use std::time::Duration;
 use std::sync::mpsc;
 use zerocopy::IntoBytes;
 
+#[derive(PartialEq, Debug)]
+enum DeckEvent {
+    StateUpdated,
+    MicroUpdated,
+    LiveUpdated,
+    ViewersUpdated,
+    FollowersUpdate,
+    None,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct State {
     is_micro_on: bool,
@@ -51,43 +61,74 @@ impl State {
         self.followers = new_value;
     }
 
-    fn serialize(&self) -> Vec<u8> {
+    fn serialize(&self, event: DeckEvent) -> Vec<u8> {
         let mut message: Vec<&[u8]> = vec![b"*"];
         let viewers = format!("V{:0>3}", self.viewers.to_string());
         let followers = format!("F{:0>3}", self.followers.to_string());
 
-        //Micro serialize
-        if self.is_micro_on {
-            message.push(b"M1");
-        } else {
-            message.push(b"M0");
+        match event {
+            DeckEvent::MicroUpdated => {
+                if self.is_micro_on {
+                    message.push(b"M1");
+                } else {
+                    message.push(b"M0");
+                }
+            }
+
+            DeckEvent::LiveUpdated => {
+                if self.is_live {
+                    message.push(b"L1");
+                } else {
+                    message.push(b"L0");
+                }
+            }
+            DeckEvent::FollowersUpdate => {
+                message.push(followers.as_bytes());
+            }
+            DeckEvent::ViewersUpdated => {
+                message.push(viewers.as_bytes());
+            }
+
+            _ => {
+                //Micro serialize
+                if self.is_micro_on {
+                    message.push(b"M1");
+                } else {
+                    message.push(b"M0");
+                }
+
+                //Live serialize
+                if self.is_live {
+                    message.push(b"L1");
+                } else {
+                    message.push(b"L0");
+                }
+
+                //Viewers serialize
+                message.push(viewers.as_bytes());
+
+                //Followers serialize
+                message.push(followers.as_bytes());
+            }
         }
-
-        //Live serialize
-        if self.is_live {
-            message.push(b"L1");
-        } else {
-            message.push(b"L0");
-        }
-
-        //Viewers serialize
-        message.push(viewers.as_bytes());
-
-        //Followers serialize
-        message.push(followers.as_bytes());
 
         message.push(b"$");
+
+        println!("Serialize: {:?}", message);
 
         message.concat()
     }
 }
 
-fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::Sender<bool>) {
+fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::Sender<DeckEvent>) {
     let mut read_buffer = [0; 8];
     // let port = Arc::clone(&state.port);
 
     loop {
-        println!("Read thread");
+        // println!("Read thread");
+        // thread::sleep(time::Duration::from_millis(40));
+        thread::sleep(time::Duration::from_millis(60));
+        //
         // match read_buffer {
         //     [first, second, third, ..] => {
         //         println!("first {:#?}", first);
@@ -122,7 +163,7 @@ fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::S
 
                             state.set_is_micro_on(false);
                         }
-                        tx.send(true).unwrap();
+                        tx.send(DeckEvent::MicroUpdated).unwrap();
                     }
 
                     if second == b'4' {
@@ -145,30 +186,32 @@ fn read_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, tx: mpsc::S
                     }
                 }
             };
-            thread::sleep(time::Duration::from_millis(60));
+            // thread::sleep(time::Duration::from_millis(60));
         }
     }
 }
 
 //1.Serialize state
 //2. Listen to state chagne
-fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>) {
+fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, event: DeckEvent) {
     // let message = b"*M1L1V204F001$";
+    println!("Event2: {:?}", event);
 
     let state = state.lock().unwrap();
-    let message = state.serialize();
+    let message = state.serialize(event);
     let port = port.lock().unwrap();
 
-    // println!("Message: {:?}", message);
+    println!("Message: {:?}", message);
+
     for byte in message {
         println!("Write: {}", byte);
         port.write(byte.as_bytes()).expect("Error writing bytes");
         // port.write_all(byte.as_bytes()).expect("Error writing bytes");
         port.flush().unwrap();
 
-        thread::sleep(time::Duration::from_millis(20)); // Delay in write: 20 x 14 = 280ms
-        // thread::sleep(time::Duration::from_millis(30));
+        thread::sleep(time::Duration::from_millis(35)); // Delay in write: 20 x 14 = 280ms
     }
+
     // }
     // thread::sleep(time::Duration::from_millis(2000));
     // }
@@ -183,30 +226,9 @@ fn do_main() -> Result<(), ()> {
 
     // let port: Arc<SerialPort> = Arc::new(port);
 
-    let (tx, rx) = mpsc::channel::<bool>();
+    let (tx, rx) = mpsc::channel::<DeckEvent>();
 
     let state = Arc::new(Mutex::new(State::new()));
-    // let port = state.port;
-
-    // let state = Arc::new(Mutex::new(State {
-    //     is_micro_on: true,
-    //     is_live: true,
-    //     viewers: 20,
-    //     followers: 321,
-    // }));
-
-    // let write_state = state.clone();
-    // state = State {
-    //     is_micro_on: true,
-    //     is_live: true,
-    //     viewers: 20,
-    //     followers: 321,
-    // };
-
-    // let writer_port = port.clone();
-
-    // let reader_handle = tokio::spawn(async move { read_deck(read_state, reader_port).await });
-    // let writer_handle = tokio::spawn(async move { write_deck(write_state, writer_port).await });
 
     let reader_handle = thread::spawn({
         let reader_state = Arc::clone(&state);
@@ -219,17 +241,32 @@ fn do_main() -> Result<(), ()> {
     loop {
         // println!("Write thread");
 
-        let res = match rx.try_recv() {
+        let event = match rx.try_recv() {
             Ok(val) => val,
-            Err(_) => false,
+            Err(_) => DeckEvent::None,
         };
 
-        if res {
+        if event != DeckEvent::None {
+            println!("Event: {:?}", event);
             let writer_state = Arc::clone(&state);
             let writer_port = Arc::clone(&port);
 
-            write_deck(writer_state, writer_port);
-            tx.send(false).unwrap();
+            write_deck(writer_state, writer_port, event);
+            tx.send(DeckEvent::None).unwrap();
+
+            // match event {
+            //     DeckEvent::StateUpdated => {}
+
+            //     DeckEvent::MicroUpdated => {}
+
+            //     DeckEvent::FollowersUpdate => {}
+
+            //     DeckEvent::LiveUpdated => {}
+
+            //     DeckEvent::ViewersUpdated => {}
+
+            //     DeckEvent::None => (),
+            // }
         }
     }
 
