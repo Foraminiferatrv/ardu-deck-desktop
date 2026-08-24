@@ -13,7 +13,7 @@ function App() {
   useEffect(() => {
     async function initDeck() {
       if (!isInitRef.current) {
-        await invoke("listen_discord_mic")
+
         await invoke("init_deck")
         isInitRef.current = true;
       }
@@ -23,7 +23,7 @@ function App() {
   }, []);
 
   async function handleAuthDiscord() {
-    await invoke("auth_discord");
+    await invoke("listen_discord_mic")
   }
 
   async function handleAuthTwitch() {

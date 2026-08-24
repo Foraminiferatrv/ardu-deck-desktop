@@ -7,7 +7,7 @@ use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
 use enigo::Direction::{Click, Press, Release};
 use enigo::Key::N;
 use enigo::{Button, Enigo, Key, Keyboard};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serial2::SerialPort;
 use std::sync::{Arc, Mutex};
@@ -243,6 +243,7 @@ fn write_deck(state: Arc<Mutex<State>>, port: Arc<Mutex<SerialPort>>, event: Dec
         thread::sleep(time::Duration::from_millis(35)); // Delay in write: 20 x 14 = 280ms
     }
 }
+
 // Data: Object {"cmd": String("AUTHORIZE"), "data": Object {"code": String("VVL5XYSmTtf2lPYZzsHUSAzTXJpeqO")}, "evt": Null, "nonce": String("null")}
 #[derive(Debug, Clone, Deserialize)]
 struct DiscordAuthorizeData {
@@ -257,8 +258,30 @@ struct DiscordAuthorizeResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StreamKitTokenResponse {
-    pub access_token: String,
+struct DiscordTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RPCMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DiscordVoiceData {
+    #[serde(default)]
+    mute: bool,
+    #[serde(default)]
+    deaf: bool,
 }
 
 #[tauri::command]
@@ -273,10 +296,10 @@ async fn listen_discord_mic() {
 
     match client.connect() {
         Err(e) => {
-            println!("Connecting discord error: {:?}", e);
+            println!("Connecting discord error: {:?}\n", e);
             return ();
         }
-        Ok(v) => println!("Connecting discord success: {:?}", v),
+        Ok(v) => println!("Connecting discord success: {:?}\n", v),
     };
 
     // loop {
@@ -299,52 +322,71 @@ async fn listen_discord_mic() {
     });
 
     match client.send(auth_data, 1) {
-        Err(e) => println!("auth Error: {:?}", e),
-        Ok(data) => println!("auth: {:?}", data),
+        Err(e) => println!("auth Error: {:?}\n", e),
+        Ok(data) => println!("auth: {:?}\n", data),
     };
     match client.recv() {
-        Err(e) => println!("Recv Error: {:?}", e),
+        Err(e) => println!("Recv Error: {:?}\n", e),
         Ok((_code, data)) => {
-            println!("Data: {}", data);
+            println!("Data: {}\n", data);
             let de_res: DiscordAuthorizeResponse = serde_json::from_value(data).unwrap();
 
             let client = reqwest::Client::new();
+            // let req = client
+            //     .post("https://streamkit.discord.com/overlay/token")
+            //     .json(&serde_json::json!({ "code": de_res.data.code }));
+            //
+
+            let form = reqwest::multipart::Form::new()
+                .text("client_id", client_id)
+                .text("grant_type", "authorization_code")
+                .text("client_secret", client_secret)
+                .text("code", de_res.data.code);
+
             let req = client
-                .post("https://streamkit.discord.com/overlay/token")
-                .json(&serde_json::json!({ "code": de_res.data.code }));
+                .post("https://discord.com/api/v10/oauth2/token")
+                .multipart(form)
+                .header("Content-Type", "application/x-www-form-urlencoded");
+
             // let req = client
             //     .post(format!(
-            //         "https://discord.com/api/v10/oauth2/token?client_id={}&client_secret={}&code={}&grant_type=authorization_code&redirect_uri=http://localhost",
+            //         "https://discord.com/api/v10/oauth2/token?client_id={}&client_secret={}&scope=rpc&code={}&grant_type=authorization_code&redirect_uri=http://localhost",
             //         client_id, client_secret, de_res.data.code
             //     ))
             //     .header("Content-Type", "application/x-www-form-urlencoded");
+
             // .header("Accept-Encoding", "application/x-www-form-urlencoded");
+            // "https://discord.com/api/v10/oauth2/token?client_id={}&client_secret={}&code={}&grant_type=authorization_code&redirect_uri=http://localhost",
 
-            println!("REQUEST: {:?}", req);
+            println!("REQUEST: {:?}\n", req);
             let res = req.send().await.unwrap();
-            let res_json = match res.json::<StreamKitTokenResponse>().await {
-                Err(e) => {
-                    println!("json eror xxxxxx {:?}", e);
+            println!("RESPONSE::::: {:?}\n", res);
+            // println!("RESPONSE_bytes::::: {:?}\n", res.bytes().await);
 
-                    StreamKitTokenResponse {
+            let token = match res.json::<DiscordTokenResponse>().await {
+                Err(e) => {
+                    println!("json eror xxxxxx {:?}\n", e);
+
+                    DiscordTokenResponse {
                         access_token: String::from("None"),
                     }
                 }
                 Ok(access_token) => access_token,
             };
 
-            println!("RES++++++ {:?}", res_json);
+            println!("RES++++++ {:?}\n", token);
             // &grant_type=authorization_code
-            // access_token = Some(de_res.data.code);
+            access_token = Some(token.access_token);
         }
     };
 
-    println!("Token::::::::::::::::  {:?}", access_token);
+    println!("Token::::::::::::::::  {:?}\n", access_token);
 
     match access_token {
         None => {
             println!("No token.");
         }
+
         Some(token) => {
             let authenticate_date = serde_json::json!({
               "nonce": "null",
@@ -356,36 +398,50 @@ async fn listen_discord_mic() {
             });
 
             match client.send(authenticate_date, 1) {
-                Err(e) => println!("authenticate Error: {:?}", e),
-                Ok(data) => println!("authenticate: {:?}", data),
+                Err(e) => println!("authenticate Error: {:?}\n", e),
+                Ok(data) => println!("authenticate: {:?}\n", data),
             };
 
             match client.recv() {
-                Err(e) => println!("Recv Error: {:?}", e),
+                Err(e) => println!("Recv Error: {:?}\n", e),
                 Ok((code, data)) => {
-                    println!("Data: {}", data);
+                    println!("Data: {}\n", data);
                     // let de_res: DiscordAuthorizeResponse = serde_json::from_value(data).unwrap();
 
                     // access_token = Some(de_res.data.code);
                 }
             };
+
+            let settings_req_data = serde_json::json!({
+              "nonce": "null",
+              "args": {
+                  "access_token": token
+              },
+              // "cmd": "GET_VOICE_SETTINGS"
+              "cmd": "SUBSCRIBE",
+              "evt":"VOICE_SETTINGS_UPDATE"
+            });
+
+            match client.send(settings_req_data, 1) {
+                Err(e) => println!("send Error: {:?}", e),
+                Ok(data) => println!("send: {:?}", data),
+            };
+
+            loop {
+                match client.recv() {
+                    Err(e) => println!("Recv settings Error: {:?}\n", e),
+                    Ok((_code, data)) => {
+                        println!("data: {:?}\n", data);
+                        let msg: RPCMessage = serde_json::from_value(data).unwrap_or_default();
+                        let voice_status: DiscordVoiceData = serde_json::from_value(msg.data.unwrap_or_default()).unwrap_or_default();
+                        println!("settings: {:?}\n", voice_status);
+                        let is_mute = voice_status.mute;
+                        println!("IS MUTE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!: {}\n", is_mute);
+                    }
+                };
+            }
         }
     };
-
-    // match client.send(json!({"GET_VOICE_SETTINGS":""}), 1) {
-    //     Err(e) => println!("send Error: {:?}", e),
-    //     Ok(data) => println!("send: {:?}", data),
-    // };
-
-    // Err(e) => println!("Recv Error: {:?}", e),
-    // Ok(data) => println!("Recv===================: {:?}", data),
-
-    // thread::sleep(Duration::from_millis(100));
-    // }
-    // activity::Activity::state(self, state)
-
-    // let payload = activity::Activity::new().state("Hello world!");
-    // client.set_activity(payload)?;
 }
 
 #[tauri::command]
