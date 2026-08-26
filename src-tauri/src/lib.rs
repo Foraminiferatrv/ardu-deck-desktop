@@ -7,7 +7,7 @@ use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use enigo::Direction::{Click, Press, Release};
 use enigo::{Button, Enigo, Key, Keyboard};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use serial2::SerialPort;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,9 +44,9 @@ enum DeckEvent {
     None,
 }
 
-#[derive(Default, Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug, Serialize)]
 struct AppState {
-    is_discrod_auth: bool,
+    is_discord_auth: bool,
     is_twitch_auth: bool,
     is_micro_on: bool,
     is_live: bool,
@@ -57,7 +57,7 @@ struct AppState {
 impl AppState {
     fn new() -> AppState {
         AppState {
-            is_discrod_auth: false,
+            is_discord_auth: false,
             is_twitch_auth: false,
             is_live: false,
             is_micro_on: false,
@@ -275,14 +275,14 @@ async fn init_discord(app: AppHandle) -> Result<(), ()> {
             let mut state = state_mutex.lock().unwrap();
 
             if code != serde_json::Number::from(4009) {
-                state.is_discrod_auth = true;
+                state.is_discord_auth = true;
                 app.emit("discord-auth", true).ok();
             } else {
                 //Rearuth if the code is invalid
                 store.delete("access_token");
                 access_token = store.get("access_token");
                 app.emit("discord-auth", false).ok();
-                state.is_discrod_auth = false;
+                state.is_discord_auth = false;
             }
         }
     };
@@ -350,7 +350,7 @@ fn read_deck(app: AppHandle, port: Arc<Mutex<SerialPort>>, tx: mpsc::Sender<Deck
 
                         println!("state: {:?}", state);
 
-                        if state.is_discrod_auth {
+                        if state.is_discord_auth {
                             if fourth == b'1' {
                                 if !state.is_micro_on {
                                     en.key(Key::F13, Click).unwrap();
@@ -523,17 +523,24 @@ enum TauriDeckEvent {
     None,
 }
 
-// #[tauri::command]
-// async fn get_state(app: AppHandle) -> AppState {
-//     let state_mutex = app.state::<Mutex<AppState>>();
-//     let state = state_mutex.lock().unwrap();
+#[tauri::command]
+async fn get_state(app: AppHandle) -> Value {
+    println!("!!!!!!!!!!!!!!!!!!Get state\n");
 
-//     *state
-// }
+    let state_mutex = app.state::<Mutex<AppState>>();
+    let state = state_mutex.lock().unwrap();
+
+    println!("+++++++++++++++++++++++++++++++Get state: {:?}\n", state);
+
+    serde_json::json!(*state)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    dotenv::dotenv().ok();
+    // let env_path = include_str!("../../.env");
+    dotenv::from_filename(".env").ok();
+    // dotenv::from_path("../../.env").ok();
+    // dotenv::dotenv().ok().load();
     // service.
     // let (tx, rx) = mpsc::channel::<TauriDeckEvent>();
 
@@ -565,7 +572,7 @@ pub fn run() {
             println!("a new app instance was opened with {argv:?} and the deep link event was already triggered");
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .invoke_handler(tauri::generate_handler![init_deck, init_discord, auth_twitch])
+        .invoke_handler(tauri::generate_handler![init_deck, init_discord, auth_twitch, get_state])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

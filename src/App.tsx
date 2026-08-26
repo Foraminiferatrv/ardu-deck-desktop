@@ -7,46 +7,84 @@ import { listen } from "@tauri-apps/api/event";
 
 import CheckIcon from "./assets/icons/check.svg";
 import CrossIcon from "./assets/icons/cross.svg";
-import { app } from "@tauri-apps/api";
+
+type AppState = {
+  followers: number,
+  is_discord_auth: boolean,
+  is_live: boolean,
+  is_micro_on: boolean,
+  is_twitch_auth: boolean,
+  viewers: number
+};
+
+const defaultState: AppState = {
+  followers: 0,
+  is_discord_auth: false,
+  is_live: false,
+  is_micro_on: false,
+  is_twitch_auth: false,
+  viewers: 0
+};
 
 function App() {
-  // const [greetMsg, setGreetMsg] = useState("");
-  // const [name, setName] = useState("");
-  // const appState = app.
-  const [isDiscordAuth, setIsDiscordAuth] = useState(false);
+  let unlisteners: (() => void)[] = [];
+
   const [isTwitchAuth, setIsTwitchAuth] = useState(false);
+  const [appState, setAppState] = useState<AppState>(defaultState);
 
   let isInitRef = useRef(false);
-  // console.log("init")
+  let isDiscordInitRef = useRef(false);
+
   async function handleAuthDiscord() {
-    console.log("handleAuthDiscord")
     await invoke("init_discord")
   }
 
-  async function handleAuthTwitch() {
-    console.log("handleAuthTwitch")
-    await invoke("auth_twitch")
+  async function updateAppState() {
+    let state: AppState = await invoke("get_state");
+    setAppState(state);
   }
 
+  async function handleAuthTwitch() {
+    // let state = await invoke("get_state");
+    // console.log({ state })
+
+  }
 
   useEffect(() => {
-    async function initDeck() {
-      if (!isInitRef.current) {
-        console.log("Init")
-        await invoke("init_deck")
-        await handleAuthDiscord();
-        isInitRef.current = true;
-      }
+    async function listenTauri() {
+      let unlisten = await listen<boolean>("discord-auth", async () => {
+        await updateAppState();
+      });
+
+      unlisteners.push(unlisten);
     }
 
-    listen<boolean>("discord-auth", (event) => {
-      setIsDiscordAuth(event.payload);
-    });
+    listenTauri();
 
-    initDeck();
+    return () => {
+      unlisteners.forEach((unlisten) => unlisten());
+    }
   }, []);
 
+  useEffect(() => {
+    async function initDiscordStart() {
+      await handleAuthDiscord();//Never returns
+      await updateAppState();
+    }
 
+    if (!isDiscordInitRef.current && !appState.is_discord_auth) {
+      isDiscordInitRef.current = true;
+      initDiscordStart();
+    }
+
+  }, [appState.is_discord_auth]);
+
+  useEffect(() => {
+    if (!isInitRef.current) {
+      isInitRef.current = true;
+      invoke("init_deck")// Never returns
+    }
+  }, []);
 
   return (
     <main className="container">
@@ -58,7 +96,7 @@ function App() {
             <img src={discordLogo} className="logo discord size-40 cursor-pointer" alt="Auth Discord" />
           </a>
           <div className="absolute bottom-5 left-4.5 bg-white size-4" />
-          {isDiscordAuth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2 " src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}
+          {appState.is_discord_auth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2 " src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}
         </div>
 
         <div className="relative">
@@ -70,21 +108,6 @@ function App() {
         </div>
       </div>
 
-      {/*<form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          // greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          // onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>*/}
-      {/*<p>{greetMsg}</p>*/}
     </main >
   );
 }
