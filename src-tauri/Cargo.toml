@@ -26,7 +26,7 @@ ascii = "1.1.0"
 serial2 = "0.2.37"
 zerocopy = {version="0.9.0-alpha.0", features = ["derive"] }
 enigo = "0.6.1"
-libobs-wrapper = "9.0.4"
+# libobs-wrapper = "9.0.4"
 twitch_oauth_token = "4.4.0"
 serenity = "0.12.5"
 tauri-plugin-deep-link = "2"
@@ -34,3 +34,5 @@ tauri-plugin-single-instance = { version = "2.0.0", features = ["deep-link"] }
 discord-rich-presence = "1.1.0"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 reqwest = { version = "0.13.4", features = ["json"] }
+tauri-plugin-store = "2"
+dotenv = "0.15.0"
