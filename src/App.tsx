@@ -45,18 +45,22 @@ function App() {
   }
 
   async function handleAuthTwitch() {
-    // let state = await invoke("get_state");
-    // console.log({ state })
-
+    await invoke("auth_twitch");
+    await updateAppState();
   }
 
   useEffect(() => {
     async function listenTauri() {
-      let unlisten = await listen<boolean>("discord-auth", async () => {
+      let unlisten_discord = await listen<boolean>("discord-auth", async () => {
         await updateAppState();
       });
 
-      unlisteners.push(unlisten);
+      let unlisten_twitch = await listen<boolean>("twitch-auth", async () => {
+        await updateAppState();
+      });
+
+      unlisteners.push(unlisten_discord);
+      unlisteners.push(unlisten_twitch);
     }
 
     listenTauri();
@@ -86,9 +90,11 @@ function App() {
     }
   }, []);
 
+  console.log({ appState })
+
   return (
     <main className="container">
-      <h1>Auth</h1>
+      <h1 className="font-bold">Auth</h1>
 
       <div className="row gap-10">
         <div className="relative">
@@ -103,7 +109,7 @@ function App() {
           <a target="_blank" onClick={handleAuthTwitch}>
             <img src={twitchLogo} className="logo twitch size-40 cursor-pointer" alt="Auth Twitch" />
             <div className="absolute bottom-5 left-4.5 bg-white size-4" />
-            {isTwitchAuth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2" src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}
+            {appState.is_twitch_auth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2" src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}
           </a>
         </div>
       </div>

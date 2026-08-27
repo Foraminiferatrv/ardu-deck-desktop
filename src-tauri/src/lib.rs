@@ -4,21 +4,47 @@ const BAUDRATE: u32 = 115200;
 
 use core::time;
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
-use dotenv;
+use dotenv::{self, Dotenv};
 use enigo::Direction::{Click, Press, Release};
 use enigo::{Button, Enigo, Key, Keyboard};
+use futures::stream::SplitStream;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use serial2::SerialPort;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, thread};
 use tauri::{async_runtime::Mutex as AsyncMutex, AppHandle, Manager};
 use tauri::{Emitter, Listener};
 use tauri_plugin_store::StoreExt;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use twitch_api::eventsub::channel::chat::message::MessageType::Text;
+use twitch_api::eventsub::channel::ChannelFollowV2;
+use twitch_api::eventsub::stream::{StreamOfflineV1, StreamOnlineV1};
+use twitch_api::eventsub::{Event, EventsubWebsocketData, SessionData, Transport, WelcomePayload};
+use twitch_api::helix::eventsub::{CreateEventSubSubscription, CreateEventSubSubscriptionRequest};
+
+use twitch_api::twitch_oauth2::{DeviceUserTokenBuilder, TwitchToken, UserToken};
+use twitch_api::{helix, twitch_oauth2, HelixClient};
+use twitch_oauth_token::{RefreshToken, Scope};
 
 use std::sync::mpsc;
 use zerocopy::IntoBytes;
+
+/// action to perform on received message
+enum WsAction {
+    /// do nothing with the message
+    Nothing,
+    /// reset the timeout and keep the connection alive
+    ResetKeepalive,
+    /// kill predecessor and swap the handle
+    KillPredecessor,
+    /// spawn successor and await death signal
+    AssignSuccessor,
+}
 
 #[derive(Debug)]
 enum DeckButton {
@@ -52,7 +78,7 @@ struct AppState {
     is_micro_on: bool,
     is_live: bool,
     viewers: i32,
-    followers: i32,
+    followers: i64,
 }
 
 impl AppState {
@@ -76,7 +102,7 @@ impl AppState {
     fn set_viewers(&mut self, new_value: i32) {
         self.viewers = new_value;
     }
-    fn set_followers(&mut self, new_value: i32) {
+    fn set_followers(&mut self, new_value: i64) {
         self.followers = new_value;
     }
 
@@ -454,7 +480,6 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
 
     let tx_mic = tx.clone();
     app.listen_any("mic-change", move |e| {
-        println!("Event || mic-change: {:?}", e);
         let data = e.payload();
 
         let _res = &tx_mic
@@ -466,11 +491,23 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
             .unwrap();
     });
 
+    let tx_followers = tx.clone();
+    app.listen_any("followers-changed", move |_e| {
+        let _res = &tx_followers.send(DeckEvent::FollowersUpdate).unwrap();
+    });
+
+    let tx_clone = tx.clone();
+    app.listen_any("live-changed", move |_e| {
+        let _res = &tx_clone.send(DeckEvent::LiveUpdated).unwrap();
+    });
+
+    let tx_clone = tx.clone();
+    app.listen_any("viewers-changed", move |_e| {
+        let _res = &tx_clone.send(DeckEvent::ViewersUpdated).unwrap();
+    });
+
     loop {
         let write_app = app.clone();
-        // write_app.listen(event, handler)
-        // println!("Write thread");
-        // println!(" State: {:?}", state.lock());
 
         let event = match rx.try_recv() {
             Ok(val) => val,
@@ -498,20 +535,207 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
 }
 
 #[tauri::command]
-async fn auth_twitch() {
+async fn auth_twitch(app: AppHandle) {
     println!("Auth Twitch.");
 
-    // let oauth = TwitchOauth::new("your_client_id", "your_client_secret").with_redirect_uri(RedirectUrl::from_str("http://localhost:3000/auth/callback")?);
+    let state_mutex = app.state::<Mutex<AppState>>();
+    let store = app.store("store.json").unwrap();
 
-    // let mut auth_request = oauth.authorization_url();
-    // auth_request.scopes_mut().send_chat_message().get_channel_emotes().modify_channel_info();
+    let access_token_value = store.get("twitch_access_token");
 
-    // let auth_url = auth_request.url();
-    // println!("Visit: {}", auth_url);
+    let reqwest = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
-    // In your callback handler:
-    // let callback: AuthCallback = /* parse from URL */;
-    // let token = oauth.exchange_code(callback.code, callback.state).await?;
+    if access_token_value.is_none() {
+        let twitch_client_id = env::var("TWITCH_CLIENT_ID").expect("No TWITCH_CLIENT_ID in .env file");
+        let client_id = twitch_oauth2::ClientId::new(twitch_client_id);
+
+        let mut builder = DeviceUserTokenBuilder::new(
+            client_id,
+            vec![twitch_oauth2::Scope::ModeratorReadFollowers, twitch_oauth2::Scope::UserReadBroadcast],
+        );
+        let code = builder.start(&reqwest).await.unwrap();
+
+        tauri_plugin_opener::open_url(&code.verification_uri, None::<&str>).unwrap();
+
+        println!("Please go to {0}", code.verification_uri);
+        println!("Waiting for user to authorize, time left: {0}", code.expires_in);
+
+        let token = builder.wait_for_code(&reqwest, tokio::time::sleep).await.unwrap();
+        store.set("twitch_access_token", json!(token.access_token));
+        store.set("twitch_refresh_token", json!(&token.refresh_token));
+    }
+
+    let access_token_value = store.get("twitch_access_token").unwrap();
+    let access_token = serde_json::from_value(access_token_value).unwrap();
+    // let refresh_token_value = store.get("twitch_refresh_token").unwrap();
+    // let refresh_token: Option<RefreshToken> = serde_json::from_value(refresh_token_value).unwrap();
+
+    let twitch_token_data = UserToken::from_token(&reqwest, access_token).await;
+
+    match twitch_token_data {
+        Ok(twitch_token) => {
+            let user_id = twitch_token.user_id.as_str();
+            // let user_id = twitch_token.
+            let access_token = &twitch_token.access_token;
+            // twitch_token.is_elapsed()
+            // twitch_token.refresh_token(&reqwest).await.unwrap();
+
+            // store.set("twitch_access_token", json!(twitch_token.access_token));
+            {
+                let mut state = state_mutex.lock().unwrap();
+                state.is_twitch_auth = true;
+            }
+
+            app.emit("twitch-auth", true).ok();
+
+            let helix_client: HelixClient<reqwest::Client> = HelixClient::default();
+            let channel = helix_client.get_channel_from_id(user_id, &twitch_token).await.unwrap().unwrap();
+            // let broa
+
+            let followers = helix_client.get_total_channel_followers(channel.broadcaster_id, &twitch_token).await.unwrap();
+
+            {
+                let mut state = state_mutex.lock().unwrap();
+
+                state.followers = followers;
+                app.emit("followers-changed", followers).ok();
+            }
+
+            let broadcaster_name = channel.broadcaster_name.as_str();
+
+            let live_data: Vec<helix::search::Channel> = helix_client
+                .search_channels(broadcaster_name, false, &twitch_token)
+                .try_collect()
+                .await
+                .unwrap();
+
+            {
+                let is_live = live_data[0].is_live;
+                // println!("is live: {:?}\n", is_live);
+                let mut state = state_mutex.lock().unwrap();
+
+                state.is_live = is_live;
+                app.emit("live-changed", is_live).ok();
+            }
+
+            let mut is_subscribed = false;
+            let config = Some(
+                WebSocketConfig::default()
+                    .max_message_size(Some(64 << 20)) // 64 MiB
+                    .max_frame_size(Some(16 << 20)) // 16 MiB
+                    .accept_unmasked_frames(false),
+            );
+
+            let stream_data: Vec<helix::streams::Stream> = helix_client
+                .get_streams_from_ids(&[user_id][..].into(), &twitch_token)
+                .try_collect()
+                .await
+                .unwrap();
+
+            println!("Streams: {:?}", stream_data);
+
+            {
+                let viewers = stream_data[0].viewer_count as i32;
+                // println!("is live: {:?}\n", is_live);
+                let mut state = state_mutex.lock().unwrap();
+
+                state.viewers = viewers;
+                app.emit("viewers-changed", viewers).ok();
+            }
+
+            let url = twitch_api::TWITCH_EVENTSUB_WEBSOCKET_URL.clone();
+
+            //Connnect to the twitch socket
+
+            let mut socket = tokio_tungstenite::connect_async_with_config(url, config, false).await.unwrap().0.split().1;
+
+            let mut session_id: Option<String> = None;
+
+            loop {
+                if !is_subscribed {
+                    match &session_id {
+                        Some(_session) => {
+                            //Send
+                            // let subscription = StreamOnlineV1();
+
+                            // let transport: Transport = Transport::websocket(session);
+                            // let _event_info: CreateEventSubSubscription<_> = helix_client
+                            //     .create_eventsub_subscription(subscription, transport, &twitch_token)
+                            //     .await
+                            //     .expect("Subscribe to event failed");
+
+                            is_subscribed = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                //Rec
+                let frame_result = match socket.next().await {
+                    Some(Ok(message)) => {
+                        match message {
+                            Message::Close(frame) => {
+                                let reason = frame.map(|frame| frame.reason).unwrap_or_default();
+
+                                println!("Socket closed: {:?}", reason);
+
+                                None
+                                // Some(messsage);
+                                // Err(eyre::eyre!("websocket stream closed unexpectedly with reason {reason}"))
+                            }
+                            Message::Frame(_) => unreachable!(),
+                            Message::Ping(_) | Message::Pong(_) => None,
+
+                            Message::Binary(_) => unimplemented!(),
+                            Message::Text(payload) => Some(payload),
+                        }
+                    }
+
+                    Some(Err(e)) => None,
+                    None => None,
+                };
+
+                match frame_result {
+                    Some(frame) => {
+                        let event = Event::parse_websocket(&frame).expect("parsing error");
+                        println!("payload: {:?} \n", event);
+
+                        match event {
+                            EventsubWebsocketData::Welcome {
+                                payload: WelcomePayload { session },
+                                ..
+                            } => {
+                                session_id = Some(session.id.to_string());
+                                // println!("session: {:?} \n", &session_data);
+
+                                // process_welcome(
+                                //     &self.subscribed,
+                                //     &self.token,
+                                //     self.helix_client,
+                                //     &self.user_id,
+                                //     session,
+                                // )
+                                // .await?;
+                                // Ok(WsAction::KillPredecessor)
+                            }
+
+                            _ => {
+                                // Ok(WsAction::Nothing)
+                            }
+                        }
+                    }
+                    None => {
+                        // println!("Stream error");
+                        // Ok(WsAction::Nothing)
+                    }
+                };
+            }
+        }
+        Err(e) => {
+            app.emit("twitch-auth", false).ok();
+            println!("Error token auth: {:?}", e);
+        }
+    };
 }
 
 enum TauriDeckEvent {
@@ -534,33 +758,14 @@ async fn get_state(app: AppHandle) -> Value {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    dotenv::from_filename(".env").unwrap().load();
-    // let env_path = include_str!("../../.env");
-    // dotenv::from_path("../../.env").ok();
-    // dotenv::dotenv().ok().load();
-    // service.
-    // let (tx, rx) = mpsc::channel::<TauriDeckEvent>();
-
-    // thread::spawn(|| {
-    //     init_deck();
-    // });
-    //
+    let env: &str = include_str!("../../.env");
+    let result: Dotenv = dotenv::from_read(env.as_bytes()).expect("Error loading env file");
+    result.load();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
             app.manage(Mutex::new(AppState::default()));
-
-            // let store = app.store("store.json")?;
-
-            // store.set("access_token", json!({ "value": 5 }));
-
-            // Get a value from the store.
-            // let value = store.get("some-key").expect("Failed to get value from store");
-            // println!("{}", value); // {"value":5}
-
-            // Remove the store from the resource table
-            // store.close_resource();
 
             Ok(())
         })
