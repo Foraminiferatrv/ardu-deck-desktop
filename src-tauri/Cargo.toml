@@ -35,4 +35,4 @@ discord-rich-presence = "1.1.0"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 reqwest = { version = "0.13.4", features = ["json"] }
 tauri-plugin-store = "2"
-dotenv = "0.15.0"
+dotenvs = "0.2.2"

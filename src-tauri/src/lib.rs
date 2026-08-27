@@ -4,6 +4,7 @@ const BAUDRATE: u32 = 115200;
 
 use core::time;
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
+use dotenv;
 use enigo::Direction::{Click, Press, Release};
 use enigo::{Button, Enigo, Key, Keyboard};
 use serde::{Deserialize, Serialize};
@@ -525,20 +526,16 @@ enum TauriDeckEvent {
 
 #[tauri::command]
 async fn get_state(app: AppHandle) -> Value {
-    println!("!!!!!!!!!!!!!!!!!!Get state\n");
-
     let state_mutex = app.state::<Mutex<AppState>>();
     let state = state_mutex.lock().unwrap();
-
-    println!("+++++++++++++++++++++++++++++++Get state: {:?}\n", state);
 
     serde_json::json!(*state)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenv::from_filename(".env").unwrap().load();
     // let env_path = include_str!("../../.env");
-    dotenv::from_filename(".env").ok();
     // dotenv::from_path("../../.env").ok();
     // dotenv::dotenv().ok().load();
     // service.
