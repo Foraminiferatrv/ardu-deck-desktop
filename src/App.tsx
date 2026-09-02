@@ -3,7 +3,7 @@ import twitchLogo from "./assets/icons/twitch.svg";
 import discordLogo from "./assets/icons/discord.svg";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 
 import CheckIcon from "./assets/icons/check.svg";
 import CrossIcon from "./assets/icons/cross.svg";
@@ -34,6 +34,7 @@ function App() {
 
   let isInitRef = useRef(false);
   let isDiscordInitRef = useRef(false);
+  let isTwitchInitRef = useRef(false);
 
   async function handleAuthDiscord() {
     await invoke("init_discord")
@@ -42,6 +43,11 @@ function App() {
   async function updateAppState() {
     let state: AppState = await invoke("get_state");
     setAppState(state);
+  }
+
+  async function handleClearStore() {
+    console.log("Clear store");
+    await invoke("clear_store");
   }
 
   async function handleAuthTwitch() {
@@ -67,21 +73,34 @@ function App() {
 
     return () => {
       unlisteners.forEach((unlisten) => unlisten());
+      // emit("clear-deck");
     }
   }, []);
 
   useEffect(() => {
     async function initDiscordStart() {
       await handleAuthDiscord();//Never returns
-      await updateAppState();
+      // await updateAppState();
+
+    }
+
+    async function initTwitchStart() {
+      await handleAuthTwitch();//Never returns
+      // await updateAppState();
     }
 
     if (!isDiscordInitRef.current && !appState.is_discord_auth) {
       isDiscordInitRef.current = true;
       initDiscordStart();
+
     }
 
-  }, [appState.is_discord_auth]);
+    if (!isTwitchInitRef.current && !appState.is_twitch_auth) {
+      isTwitchInitRef.current = true;
+      initTwitchStart();
+    }
+
+  }, [appState.is_discord_auth, appState.is_twitch_auth]);
 
   useEffect(() => {
     if (!isInitRef.current) {
@@ -90,7 +109,7 @@ function App() {
     }
   }, []);
 
-  console.log({ appState })
+  // console.log({ appState })
 
   return (
     <main className="container">
@@ -113,6 +132,10 @@ function App() {
           </a>
         </div>
       </div>
+
+      <button onClick={handleClearStore} className="absolute right-1 bottom-1" >
+        Reset Store
+      </button>
 
     </main >
   );

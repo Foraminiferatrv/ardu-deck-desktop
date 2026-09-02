@@ -3,48 +3,47 @@ extern crate core;
 const BAUDRATE: u32 = 115200;
 
 use core::time;
+
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use dotenv::{self, Dotenv};
 use enigo::Direction::{Click, Press, Release};
 use enigo::{Button, Enigo, Key, Keyboard};
-use futures::stream::SplitStream;
-use futures::{StreamExt, TryStreamExt};
+use eyre::Context;
+use futures::TryStreamExt;
+use futures::{stream::SplitStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use serial2::SerialPort;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use std::{env, thread};
 use tauri::{async_runtime::Mutex as AsyncMutex, AppHandle, Manager};
 use tauri::{Emitter, Listener};
 use tauri_plugin_store::StoreExt;
-use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message};
+use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender};
+use tokio::task::{JoinError, JoinHandle};
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use twitch_api::eventsub::channel::chat::message::MessageType::Text;
-use twitch_api::eventsub::channel::ChannelFollowV2;
-use twitch_api::eventsub::stream::{StreamOfflineV1, StreamOnlineV1};
-use twitch_api::eventsub::{Event, EventsubWebsocketData, SessionData, Transport, WelcomePayload};
-use twitch_api::helix::eventsub::{CreateEventSubSubscription, CreateEventSubSubscriptionRequest};
+use twitch_api::eventsub::{
+    self,
+    channel::{ChannelBanV1, ChannelFollowV2, ChannelUnbanV1},
+    stream::{StreamOfflineV1, StreamOnlineV1},
+    Event, EventSubscription, EventsubWebsocketData, Message as EventsubMessage, Payload, ReconnectPayload, SessionData, Transport, WelcomePayload,
+};
+use twitch_api::helix::eventsub::CreateEventSubSubscription;
+use twitch_api::twitch_oauth2::tokens::errors::ValidationError::NotAuthorized;
+use twitch_api::types::User;
+// use twitch_api::types::eventsub;
 
-use twitch_api::twitch_oauth2::{DeviceUserTokenBuilder, TwitchToken, UserToken};
-use twitch_api::{helix, twitch_oauth2, HelixClient};
-use twitch_oauth_token::{RefreshToken, Scope};
+use twitch_api::twitch_oauth2::{ClientId, DeviceUserTokenBuilder, RefreshToken, TwitchToken, UserToken};
+use twitch_api::{helix, twitch_oauth2, types, HelixClient};
 
 use std::sync::mpsc;
 use zerocopy::IntoBytes;
-
-/// action to perform on received message
-enum WsAction {
-    /// do nothing with the message
-    Nothing,
-    /// reset the timeout and keep the connection alive
-    ResetKeepalive,
-    /// kill predecessor and swap the handle
-    KillPredecessor,
-    /// spawn successor and await death signal
-    AssignSuccessor,
-}
 
 #[derive(Debug)]
 enum DeckButton {
@@ -464,6 +463,12 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
 
     let port: Arc<Mutex<SerialPort>> = Arc::new(Mutex::new(raw_port));
 
+    {
+        let init_app = app.clone();
+        let init_port = Arc::clone(&port);
+        write_deck(init_app, init_port, DeckEvent::StateUpdated);
+    }
+
     let (tx, rx) = mpsc::channel::<DeckEvent>();
 
     // let state: State<'_, Mutex<AppState>> = app.state::<Mutex<AppState>>().clone();
@@ -506,6 +511,13 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
         let _res = &tx_clone.send(DeckEvent::ViewersUpdated).unwrap();
     });
 
+    let tx_clone = tx.clone();
+    app.listen_any("clear-deck", move |_e| {
+        println!("Clearing deck");
+
+        tx_clone.send(DeckEvent::StateUpdated).unwrap();
+    });
+
     loop {
         let write_app = app.clone();
 
@@ -534,21 +546,349 @@ async fn init_deck(app: AppHandle) -> Result<(), ()> {
     }
 }
 
+//SOcket impl
+//
+async fn refresh_if_expired(token: Arc<AsyncMutex<UserToken>>, helix_client: &HelixClient<'_, reqwest::Client>) {
+    let mut lock = token.lock().await;
+
+    if lock.expires_in() >= Duration::from_secs(60) {
+        return;
+    }
+    let client = helix_client.get_client();
+
+    lock.refresh_token(client).await.unwrap();
+    // TODO: token refresh logic is left up to the user
+
+    drop(lock);
+}
+
+/// action to perform on received message
+enum WsAction {
+    /// do nothing with the message
+    Nothing,
+    /// reset the timeout and keep the connection alive
+    ResetKeepalive,
+    /// kill predecessor and swap the handle
+    KillPredecessor,
+    /// spawn successor and await death signal
+    AssignSuccessor(SocketHandle),
+}
+
+async fn subscribe(
+    helix_client: &HelixClient<'_, reqwest::Client>,
+    session_id: String,
+    token: &UserToken,
+    subscription: impl EventSubscription + Send,
+) -> eyre::Result<()> {
+    let transport: Transport = Transport::websocket(session_id);
+    let _event_info: CreateEventSubSubscription<_> = helix_client.create_eventsub_subscription(subscription, transport, token).await?;
+    Ok(())
+}
+
+async fn process_welcome(
+    subscribed: &AtomicBool,
+    token: &AsyncMutex<UserToken>,
+    helix_client: &HelixClient<'_, reqwest::Client>,
+    user_id: &types::UserId,
+    session: SessionData<'_>,
+) -> eyre::Result<()> {
+    // if we're already subscribed, don't subscribe again
+    if subscribed.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let user_token = token.lock().await;
+
+    tokio::try_join!(
+        subscribe(
+            helix_client,
+            session.id.to_string(),
+            &user_token,
+            StreamOnlineV1::broadcaster_user_id(user_id.clone())
+        ),
+        subscribe(
+            helix_client,
+            session.id.to_string(),
+            &user_token,
+            StreamOfflineV1::broadcaster_user_id(user_id.clone())
+        ),
+        // subscribe(
+        //     helix_client,
+        //     session.id.to_string(),
+        //     &user_token,
+        //     ChannelFollowV2::broadcaster_user_id(user_id.clone())
+        // ),
+    )?;
+
+    subscribed.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Here is where you would handle the events you want to listen to
+fn process_payload(event: Event) -> eyre::Result<WsAction> {
+    match event {
+        Event::ChannelBanV1(Payload { message, .. }) => {
+            match message {
+                // not needed for websocket
+                EventsubMessage::VerificationRequest(_) => unreachable!(),
+                EventsubMessage::Revocation() => Err(eyre::eyre!("unexpected subscription revocation")),
+                EventsubMessage::Notification(payload) => {
+                    // do something useful with the payload
+                    tracing::info!(?payload, "got ban event");
+
+                    // new events reset keepalive timeout too
+                    Ok(WsAction::ResetKeepalive)
+                }
+                _ => Ok(WsAction::Nothing),
+            }
+        }
+        Event::ChannelUnbanV1(eventsub::Payload { message, .. }) => {
+            match message {
+                // not needed for websocket
+                EventsubMessage::VerificationRequest(_) => unreachable!(),
+                EventsubMessage::Revocation() => Err(eyre::eyre!("unexpected subscription revocation")),
+                EventsubMessage::Notification(payload) => {
+                    // do something useful with the payload
+                    tracing::info!(?payload, "got unban event");
+
+                    // new events reset keepalive timeout too
+                    Ok(WsAction::ResetKeepalive)
+                }
+                _ => Ok(WsAction::Nothing),
+            }
+        }
+        _ => Ok(WsAction::Nothing),
+    }
+}
+
+struct WebSocketConnection {
+    socket: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
+    helix_client: &'static HelixClient<'static, reqwest::Client>,
+    token: Arc<AsyncMutex<UserToken>>,
+    // opts: Arc<crate::Opts>,
+    subscribed: Arc<AtomicBool>,
+    user_id: Arc<types::UserId>,
+    kill_self_tx: UnboundedSender<()>,
+}
+
+impl WebSocketConnection {
+    async fn receive_message(&mut self) -> eyre::Result<Option<String>> {
+        let Some(message) = self.socket.next().await else {
+            return Err(eyre::eyre!("websocket stream closed unexpectedly"));
+        };
+        match message.context("tungstenite error")? {
+            WsMessage::Close(frame) => {
+                let reason = frame.map(|frame| frame.reason).unwrap_or_default();
+                Err(eyre::eyre!("websocket stream closed unexpectedly with reason {reason}"))
+            }
+            WsMessage::Frame(_) => unreachable!(),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => {
+                // no need to do anything as tungstenite automatically handles pings for you
+                // but refresh the token just in case
+                refresh_if_expired(self.token.clone(), self.helix_client).await;
+                Ok(None)
+            }
+            WsMessage::Binary(_) => unimplemented!(),
+            WsMessage::Text(payload) => Ok(Some(payload.to_string())),
+        }
+    }
+
+    async fn process_message(&self, frame: String) -> eyre::Result<WsAction> {
+        println!("process_message");
+        println!("{:?}", frame);
+
+        let event_data = Event::parse_websocket(&frame).context("parsing error")?;
+        match event_data {
+            EventsubWebsocketData::Welcome {
+                payload: WelcomePayload { session },
+                ..
+            } => {
+                process_welcome(&self.subscribed, &self.token, self.helix_client, &self.user_id, session).await?;
+                Ok(WsAction::KillPredecessor)
+            }
+            EventsubWebsocketData::Reconnect {
+                payload: ReconnectPayload { session },
+                ..
+            } => {
+                let url: String = session.reconnect_url.unwrap().into_owned();
+                let successor = SocketHandle::spawn(
+                    url,
+                    self.helix_client,
+                    self.kill_self_tx.clone(),
+                    self.token.clone(),
+                    // self.opts.clone(),
+                    self.subscribed.clone(),
+                    self.user_id.clone(),
+                );
+                Ok(WsAction::AssignSuccessor(successor))
+            }
+            EventsubWebsocketData::Keepalive { .. } => Ok(WsAction::ResetKeepalive),
+            EventsubWebsocketData::Revocation { metadata, .. } => {
+                eyre::bail!("got revocation: {metadata:?}")
+            }
+            EventsubWebsocketData::Notification { payload: event, .. } => process_payload(event),
+            _ => Ok(WsAction::Nothing),
+        }
+    }
+}
+
+async fn connect_socket(request: impl IntoClientRequest + Unpin) -> Result<SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>, eyre::Error> {
+    let config = Some(
+        WebSocketConfig::default()
+            .max_message_size(Some(64 << 20)) // 64 MiB
+            .max_frame_size(Some(16 << 20)) // 16 MiB
+            .accept_unmasked_frames(false),
+    );
+    let socket = tokio_tungstenite::connect_async_with_config(request, config, false)
+        .await
+        .context("Can't connect to twitch socket")
+        .unwrap()
+        .0
+        .split()
+        .1;
+
+    Ok(socket)
+}
+
+struct SocketHandle(JoinHandle<eyre::Result<SocketHandle>>);
+
+impl SocketHandle {
+    pub fn spawn(
+        url: impl IntoClientRequest + Unpin + Send + 'static,
+        helix_client: &'static HelixClient<'_, reqwest::Client>,
+        kill_predecessor_tx: UnboundedSender<()>,
+        token: Arc<AsyncMutex<UserToken>>,
+        // opts: Arc<crate::Opts>,
+        subscribed: Arc<AtomicBool>,
+        user_id: Arc<types::UserId>,
+    ) -> Self {
+        Self(tokio::spawn(async move {
+            println!("Swawning socket");
+            let socket = connect_socket(url).await?;
+            // If we receive a reconnect message we want to spawn a new connection to twitch.
+            // The already existing session should wait on the new session to receive a welcome message before being closed.
+            // https://dev.twitch.tv/docs/eventsub/handling-websocket-events/#reconnect-message
+            let (kill_self_tx, mut kill_self_rx) = tokio_mpsc::unbounded_channel::<()>();
+
+            let mut connection = WebSocketConnection {
+                socket,
+                helix_client,
+                token,
+                // opts,
+                subscribed,
+                user_id,
+                kill_self_tx,
+            };
+
+            /// default keepalive duration is 10 seconds
+            const WINDOW: u64 = 10;
+            let mut timeout: Instant = Instant::now() + Duration::from_secs(WINDOW);
+            let mut successor: Option<Self> = None;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    result = kill_self_rx.recv() => {
+                        println!("Kill self socket");
+
+                        result.unwrap();
+                        let Some(successor) = successor else {
+                            // can't receive death signal from successor if it isn't spawned yet
+                            unreachable!();
+                        };
+                        return Ok(successor);
+                    }
+                    result = connection.receive_message() => if let Some(frame) = result? {
+                        let side_effect = connection.process_message(frame).await?;
+
+                        match side_effect {
+                            WsAction::Nothing => {}
+                            WsAction::ResetKeepalive => timeout = Instant::now() + Duration::from_secs(WINDOW),
+                            WsAction::KillPredecessor => {
+                                kill_predecessor_tx.send(())?
+                            },
+                            WsAction::AssignSuccessor(actor_handle) => {
+                                successor = Some(actor_handle);
+                            },
+                        }
+                    },
+                    _ = tokio::time::sleep_until(timeout) => eyre::bail!("connection timed out"),
+                }
+            }
+        }))
+    }
+
+    pub async fn join(self) -> Result<eyre::Result<Self>, JoinError> {
+        self.0.await
+    }
+}
+
+//SOcket impl end
+static HELIX_CLIENT: LazyLock<HelixClient<'_, reqwest::Client>> = LazyLock::new(|| HelixClient::default());
+
+async fn get_twitch_data(
+    helix_client: &'static HelixClient<'static, reqwest::Client>,
+    app: &AppHandle,
+    user_id: &str,
+    twitch_token_mutex: Arc<AsyncMutex<UserToken>>,
+) -> Result<(), eyre::Error> {
+    println!("Fetch twitch data");
+    let twitch_token = twitch_token_mutex.lock().await.clone();
+    let state_mutex = app.state::<Mutex<AppState>>();
+
+    let channel = helix_client.get_channel_from_id(user_id, &twitch_token).await.unwrap().unwrap();
+    let broadcaster_name = channel.broadcaster_name.as_str();
+    let followers = helix_client.get_total_channel_followers(channel.broadcaster_id, &twitch_token).await.unwrap();
+
+    {
+        let mut state = state_mutex.lock().unwrap();
+
+        state.followers = followers;
+        app.emit("followers-changed", followers).ok();
+    }
+
+    let live_data: Vec<helix::search::Channel> = helix_client.search_channels(broadcaster_name, false, &twitch_token).try_collect().await?;
+
+    {
+        let is_live = live_data[0].is_live;
+        let mut state = state_mutex.lock().unwrap();
+
+        state.is_live = is_live;
+        app.emit("live-changed", is_live).ok();
+    }
+
+    let stream_data: Vec<helix::streams::Stream> = helix_client
+        .get_streams_from_ids(&[user_id][..].into(), &twitch_token)
+        .try_collect()
+        .await
+        .unwrap();
+
+    println!("Streams: {:?}", stream_data);
+
+    if stream_data.len() != 0 {
+        let viewers = stream_data[0].viewer_count as i32;
+        let mut state = state_mutex.lock().unwrap();
+
+        state.viewers = viewers;
+        app.emit("viewers-changed", viewers).ok();
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 async fn auth_twitch(app: AppHandle) {
     println!("Auth Twitch.");
 
     let state_mutex = app.state::<Mutex<AppState>>();
     let store = app.store("store.json").unwrap();
+    let twitch_client_id = env::var("TWITCH_CLIENT_ID").expect("No TWITCH_CLIENT_ID in .env file");
 
     let access_token_value = store.get("twitch_access_token");
 
     let reqwest = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
     if access_token_value.is_none() {
-        let twitch_client_id = env::var("TWITCH_CLIENT_ID").expect("No TWITCH_CLIENT_ID in .env file");
-        let client_id = twitch_oauth2::ClientId::new(twitch_client_id);
-
+        let client_id = twitch_oauth2::ClientId::new(twitch_client_id.clone());
         let mut builder = DeviceUserTokenBuilder::new(
             client_id,
             vec![twitch_oauth2::Scope::ModeratorReadFollowers, twitch_oauth2::Scope::UserReadBroadcast],
@@ -567,17 +907,45 @@ async fn auth_twitch(app: AppHandle) {
 
     let access_token_value = store.get("twitch_access_token").unwrap();
     let access_token = serde_json::from_value(access_token_value).unwrap();
-    // let refresh_token_value = store.get("twitch_refresh_token").unwrap();
-    // let refresh_token: Option<RefreshToken> = serde_json::from_value(refresh_token_value).unwrap();
+
+    let refresh_token_value = store.get("twitch_refresh_token").unwrap();
+
+    // println!("Refresh token value {:?}\n", refresh_token_value);
+    let refresh_token_string: String = serde_json::from_value(refresh_token_value).unwrap();
+    let refresh_token = RefreshToken::from_str(refresh_token_string.as_str()).unwrap();
 
     let twitch_token_data = UserToken::from_token(&reqwest, access_token).await;
+    // let n = RefreshToken::
+    // let twitch_token_data = UserToken::from_existing(&reqwest, access_token, refresh_token, None).await;
 
     match twitch_token_data {
+        Err(e) => {
+            match e.error {
+                NotAuthorized => {
+                    let client_id = twitch_oauth2::ClientId::new(twitch_client_id);
+
+                    let token = UserToken::from_refresh_token(&reqwest, refresh_token, client_id, None).await.unwrap();
+
+                    store.set("twitch_access_token", json!(token.access_token));
+
+                    println!("Twitch Token refreshed\n");
+
+                    Box::pin(auth_twitch(app)).await;
+                }
+
+                _ => {
+                    app.emit("twitch-auth", false).ok();
+                    println!("Error token auth: {:?}", e);
+                }
+            };
+        }
+
         Ok(twitch_token) => {
+            let helix_client: &'static HelixClient<_> = LazyLock::force(&HELIX_CLIENT);
             let user_id = twitch_token.user_id.as_str();
             // let user_id = twitch_token.
             let access_token = &twitch_token.access_token;
-            // twitch_token.is_elapsed()
+
             // twitch_token.refresh_token(&reqwest).await.unwrap();
 
             // store.set("twitch_access_token", json!(twitch_token.access_token));
@@ -588,152 +956,57 @@ async fn auth_twitch(app: AppHandle) {
 
             app.emit("twitch-auth", true).ok();
 
-            let helix_client: HelixClient<reqwest::Client> = HelixClient::default();
-            let channel = helix_client.get_channel_from_id(user_id, &twitch_token).await.unwrap().unwrap();
-            // let broa
+            //Connnect to the twitch socket
+            let url = twitch_api::TWITCH_EVENTSUB_WEBSOCKET_URL.clone();
+            let user_id = Arc::new(twitch_token.user_id.clone());
+            let token_mutex = Arc::new(AsyncMutex::new(twitch_token));
+            let subscribed = Arc::new(AtomicBool::new(false));
 
-            let followers = helix_client.get_total_channel_followers(channel.broadcaster_id, &twitch_token).await.unwrap();
+            // get_twitch_data(helix_client, &app, user_id, twitch_token.clone()).await;
 
-            {
-                let mut state = state_mutex.lock().unwrap();
+            let (dummy_tx, _unused_rx) = tokio_mpsc::unbounded_channel::<()>();
 
-                state.followers = followers;
-                app.emit("followers-changed", followers).ok();
-            }
-
-            let broadcaster_name = channel.broadcaster_name.as_str();
-
-            let live_data: Vec<helix::search::Channel> = helix_client
-                .search_channels(broadcaster_name, false, &twitch_token)
-                .try_collect()
-                .await
-                .unwrap();
-
-            {
-                let is_live = live_data[0].is_live;
-                // println!("is live: {:?}\n", is_live);
-                let mut state = state_mutex.lock().unwrap();
-
-                state.is_live = is_live;
-                app.emit("live-changed", is_live).ok();
-            }
-
-            let mut is_subscribed = false;
-            let config = Some(
-                WebSocketConfig::default()
-                    .max_message_size(Some(64 << 20)) // 64 MiB
-                    .max_frame_size(Some(16 << 20)) // 16 MiB
-                    .accept_unmasked_frames(false),
+            let mut handle = SocketHandle::spawn(
+                url.clone(),
+                &helix_client,
+                dummy_tx.clone(),
+                token_mutex.clone(),
+                // opts.clone(),
+                subscribed.clone(),
+                user_id.clone(),
             );
 
-            let stream_data: Vec<helix::streams::Stream> = helix_client
-                .get_streams_from_ids(&[user_id][..].into(), &twitch_token)
-                .try_collect()
-                .await
-                .unwrap();
+            let polling_token = token_mutex.clone();
+            let polling_user_id = user_id.clone();
 
-            println!("Streams: {:?}", stream_data);
-
-            {
-                let viewers = stream_data[0].viewer_count as i32;
-                // println!("is live: {:?}\n", is_live);
-                let mut state = state_mutex.lock().unwrap();
-
-                state.viewers = viewers;
-                app.emit("viewers-changed", viewers).ok();
-            }
-
-            let url = twitch_api::TWITCH_EVENTSUB_WEBSOCKET_URL.clone();
-
-            //Connnect to the twitch socket
-
-            let mut socket = tokio_tungstenite::connect_async_with_config(url, config, false).await.unwrap().0.split().1;
-
-            let mut session_id: Option<String> = None;
+            tokio::spawn(async move {
+                loop {
+                    println!("Polling \n");
+                    get_twitch_data(helix_client, &app, polling_user_id.as_str(), polling_token.clone())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(40)).await;
+                }
+            });
 
             loop {
-                if !is_subscribed {
-                    match &session_id {
-                        Some(_session) => {
-                            //Send
-                            // let subscription = StreamOnlineV1();
-
-                            // let transport: Transport = Transport::websocket(session);
-                            // let _event_info: CreateEventSubSubscription<_> = helix_client
-                            //     .create_eventsub_subscription(subscription, transport, &twitch_token)
-                            //     .await
-                            //     .expect("Subscribe to event failed");
-
-                            is_subscribed = true;
-                        }
-                        _ => {}
+                println!("Loop");
+                handle = match handle.join().await.unwrap() {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        subscribed.store(false, Ordering::Relaxed);
+                        tracing::error!("{err}");
+                        SocketHandle::spawn(
+                            url.clone(),
+                            helix_client,
+                            dummy_tx.clone(),
+                            token_mutex.clone(),
+                            subscribed.clone(),
+                            user_id.clone(),
+                        )
                     }
                 }
-
-                //Rec
-                let frame_result = match socket.next().await {
-                    Some(Ok(message)) => {
-                        match message {
-                            Message::Close(frame) => {
-                                let reason = frame.map(|frame| frame.reason).unwrap_or_default();
-
-                                println!("Socket closed: {:?}", reason);
-
-                                None
-                                // Some(messsage);
-                                // Err(eyre::eyre!("websocket stream closed unexpectedly with reason {reason}"))
-                            }
-                            Message::Frame(_) => unreachable!(),
-                            Message::Ping(_) | Message::Pong(_) => None,
-
-                            Message::Binary(_) => unimplemented!(),
-                            Message::Text(payload) => Some(payload),
-                        }
-                    }
-
-                    Some(Err(e)) => None,
-                    None => None,
-                };
-
-                match frame_result {
-                    Some(frame) => {
-                        let event = Event::parse_websocket(&frame).expect("parsing error");
-                        println!("payload: {:?} \n", event);
-
-                        match event {
-                            EventsubWebsocketData::Welcome {
-                                payload: WelcomePayload { session },
-                                ..
-                            } => {
-                                session_id = Some(session.id.to_string());
-                                // println!("session: {:?} \n", &session_data);
-
-                                // process_welcome(
-                                //     &self.subscribed,
-                                //     &self.token,
-                                //     self.helix_client,
-                                //     &self.user_id,
-                                //     session,
-                                // )
-                                // .await?;
-                                // Ok(WsAction::KillPredecessor)
-                            }
-
-                            _ => {
-                                // Ok(WsAction::Nothing)
-                            }
-                        }
-                    }
-                    None => {
-                        // println!("Stream error");
-                        // Ok(WsAction::Nothing)
-                    }
-                };
             }
-        }
-        Err(e) => {
-            app.emit("twitch-auth", false).ok();
-            println!("Error token auth: {:?}", e);
         }
     };
 }
@@ -756,6 +1029,14 @@ async fn get_state(app: AppHandle) -> Value {
     serde_json::json!(*state)
 }
 
+#[tauri::command]
+async fn clear_store(app: AppHandle) {
+    let store = app.store("store.json").unwrap();
+    store.clear();
+
+    app.request_restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let env: &str = include_str!("../../.env");
@@ -774,7 +1055,7 @@ pub fn run() {
             println!("a new app instance was opened with {argv:?} and the deep link event was already triggered");
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .invoke_handler(tauri::generate_handler![init_deck, init_discord, auth_twitch, get_state])
+        .invoke_handler(tauri::generate_handler![init_deck, init_discord, auth_twitch, get_state, clear_store])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
