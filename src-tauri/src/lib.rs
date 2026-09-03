@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use std::{env, thread};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{async_runtime::Mutex as AsyncMutex, AppHandle, Manager};
 use tauri::{Emitter, Listener};
 use tauri_plugin_store::StoreExt;
@@ -396,36 +398,42 @@ fn read_deck(app: AppHandle, port: Arc<Mutex<SerialPort>>, tx: mpsc::Sender<Deck
                         en.key(Key::F14, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52)); //OBS has a key listener with 50ms interval
                         en.key(Key::F14, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                     if second == b'5' {
                         println!("MACRO 5");
                         en.key(Key::F15, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52));
                         en.key(Key::F15, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                     if second == b'6' {
                         println!("MACRO 6");
                         en.key(Key::F16, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52));
                         en.key(Key::F16, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                     if second == b'7' {
                         println!("MACRO 7");
                         en.key(Key::F17, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52));
                         en.key(Key::F17, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                     if second == b'8' {
                         println!("MACRO 8");
                         en.key(Key::F18, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52));
                         en.key(Key::F18, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                     if second == b'9' {
                         println!("MACRO 9");
                         en.key(Key::F19, Press).unwrap();
                         thread::sleep(time::Duration::from_millis(52));
                         en.key(Key::F19, Release).unwrap();
+                        app.emit("button-pressed", true).ok();
                     }
                 }
             };
@@ -831,7 +839,7 @@ async fn get_twitch_data(
     user_id: &str,
     twitch_token_mutex: Arc<AsyncMutex<UserToken>>,
 ) -> Result<(), eyre::Error> {
-    println!("Fetch twitch data");
+    println!("\n⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️Fetch twitch data⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️");
     let twitch_token = twitch_token_mutex.lock().await.clone();
     let state_mutex = app.state::<Mutex<AppState>>();
 
@@ -844,6 +852,8 @@ async fn get_twitch_data(
 
         state.followers = followers;
         app.emit("followers-changed", followers).ok();
+
+        println!("\n==💜== Followers fetched: {}", followers);
     }
 
     let live_data: Vec<helix::search::Channel> = helix_client.search_channels(broadcaster_name, false, &twitch_token).try_collect().await?;
@@ -854,6 +864,8 @@ async fn get_twitch_data(
 
         state.is_live = is_live;
         app.emit("live-changed", is_live).ok();
+
+        println!("\n==🔴== Live fetched: {}", is_live);
     }
 
     let stream_data: Vec<helix::streams::Stream> = helix_client
@@ -862,7 +874,7 @@ async fn get_twitch_data(
         .await
         .unwrap();
 
-    println!("Streams: {:?}", stream_data);
+    // println!("==💜== Streams: {:?}\n", stream_data);
 
     if stream_data.len() != 0 {
         let viewers = stream_data[0].viewer_count as i32;
@@ -870,6 +882,7 @@ async fn get_twitch_data(
 
         state.viewers = viewers;
         app.emit("viewers-changed", viewers).ok();
+        println!("\n==😶== Viewers changed: {}", viewers);
     }
 
     Ok(())
@@ -877,7 +890,7 @@ async fn get_twitch_data(
 
 #[tauri::command]
 async fn auth_twitch(app: AppHandle) {
-    println!("Auth Twitch.");
+    println!("\nAuth Twitch.");
 
     let state_mutex = app.state::<Mutex<AppState>>();
     let store = app.store("store.json").unwrap();
@@ -985,12 +998,11 @@ async fn auth_twitch(app: AppHandle) {
                     get_twitch_data(helix_client, &app, polling_user_id.as_str(), polling_token.clone())
                         .await
                         .unwrap();
-                    tokio::time::sleep(Duration::from_secs(40)).await;
+                    tokio::time::sleep(Duration::from_secs(20)).await;
                 }
             });
 
             loop {
-                println!("Loop");
                 handle = match handle.join().await.unwrap() {
                     Ok(handle) => handle,
                     Err(err) => {
@@ -1044,9 +1056,52 @@ pub fn run() {
     result.load();
 
     tauri::Builder::default()
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                window.hide().unwrap();
+                api.prevent_close();
+            }
+            _ => {}
+        }) //Prevent close window
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
             app.manage(Mutex::new(AppState::default()));
+
+            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&quit_i])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .on_tray_icon_event(|tray, event| match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        println!("left click pressed and released");
+                        // in this example, let's show and focus the main window when the tray is clicked
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {
+                        println!("unhandled event {event:?}");
+                    }
+                })
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => {
+                        println!("quit menu item was clicked");
+                        app.exit(0);
+                    }
+                    _ => {
+                        println!("menu item {:?} not handled", event.id);
+                    }
+                })
+                .build(app)?;
 
             Ok(())
         })

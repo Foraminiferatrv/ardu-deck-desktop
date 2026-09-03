@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { emit, listen } from "@tauri-apps/api/event";
 
+import boop_sound from "./assets/sounds/boop.mp3";
+
 import CheckIcon from "./assets/icons/check.svg";
 import CrossIcon from "./assets/icons/cross.svg";
 
@@ -103,13 +105,28 @@ function App() {
   }, [appState.is_discord_auth, appState.is_twitch_auth]);
 
   useEffect(() => {
-    if (!isInitRef.current) {
-      isInitRef.current = true;
-      invoke("init_deck")// Never returns
-    }
-  }, []);
+    async function init() {
 
-  // console.log({ appState })
+      let audioElement = new Audio(boop_sound);
+      audioElement.volume = 0.5;
+
+      function initButtonListen() {
+        audioElement.pause();
+        audioElement.currentTime = 0;
+
+        audioElement.play();
+      }
+
+      if (!isInitRef.current) {
+        isInitRef.current = true;
+        invoke("init_deck")// Never returns
+        let unlisten = await listen("button-pressed", initButtonListen);
+        unlisteners.push(unlisten);
+      }
+    }
+
+    init();
+  }, []);
 
   return (
     <main className="container">
