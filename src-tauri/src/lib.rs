@@ -840,12 +840,19 @@ async fn get_twitch_data(
     twitch_token_mutex: Arc<AsyncMutex<UserToken>>,
 ) -> Result<(), eyre::Error> {
     println!("\n⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️Fetch twitch data⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️⬇️");
-    let twitch_token = twitch_token_mutex.lock().await.clone();
+
+    let mut twitch_token = twitch_token_mutex.lock().await.clone();
     let state_mutex = app.state::<Mutex<AppState>>();
 
     let channel = helix_client.get_channel_from_id(user_id, &twitch_token).await.unwrap().unwrap();
     let broadcaster_name = channel.broadcaster_name.as_str();
     let followers = helix_client.get_total_channel_followers(channel.broadcaster_id, &twitch_token).await.unwrap();
+
+    //Refresh token if expires
+    if twitch_token.expires_in() <= Duration::from_secs(60) {
+        println!("Token is about to expire. Trying to refresh...");
+        twitch_token.refresh_token(helix_client).await.context("Refreshing token from polling.")?;
+    }
 
     {
         let mut state = state_mutex.lock().unwrap();
@@ -874,8 +881,6 @@ async fn get_twitch_data(
         .await
         .unwrap();
 
-    // println!("==💜== Streams: {:?}\n", stream_data);
-
     if stream_data.len() != 0 {
         let viewers = stream_data[0].viewer_count as i32;
         let mut state = state_mutex.lock().unwrap();
@@ -895,15 +900,15 @@ async fn auth_twitch(app: AppHandle) {
     let state_mutex = app.state::<Mutex<AppState>>();
     let store = app.store("store.json").unwrap();
     let twitch_client_id = env::var("TWITCH_CLIENT_ID").expect("No TWITCH_CLIENT_ID in .env file");
+    let client_id = twitch_oauth2::ClientId::new(twitch_client_id.clone());
 
     let access_token_value = store.get("twitch_access_token");
 
     let reqwest = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
     if access_token_value.is_none() {
-        let client_id = twitch_oauth2::ClientId::new(twitch_client_id.clone());
         let mut builder = DeviceUserTokenBuilder::new(
-            client_id,
+            client_id.clone(),
             vec![twitch_oauth2::Scope::ModeratorReadFollowers, twitch_oauth2::Scope::UserReadBroadcast],
         );
         let code = builder.start(&reqwest).await.unwrap();
@@ -927,100 +932,69 @@ async fn auth_twitch(app: AppHandle) {
     let refresh_token_string: String = serde_json::from_value(refresh_token_value).unwrap();
     let refresh_token = RefreshToken::from_str(refresh_token_string.as_str()).unwrap();
 
-    let twitch_token_data = UserToken::from_token(&reqwest, access_token).await;
-    // let n = RefreshToken::
-    // let twitch_token_data = UserToken::from_existing(&reqwest, access_token, refresh_token, None).await;
+    let twitch_token = UserToken::from_existing_or_refresh_token(&reqwest, access_token, refresh_token, client_id, None)
+        .await
+        .context("Creating user token from refresh token...")
+        .unwrap();
 
-    match twitch_token_data {
-        Err(e) => {
-            match e.error {
-                NotAuthorized => {
-                    let client_id = twitch_oauth2::ClientId::new(twitch_client_id);
+    let helix_client: &'static HelixClient<_> = LazyLock::force(&HELIX_CLIENT);
+    {
+        let mut state = state_mutex.lock().unwrap();
+        state.is_twitch_auth = true;
+    }
 
-                    let token = UserToken::from_refresh_token(&reqwest, refresh_token, client_id, None).await.unwrap();
+    app.emit("twitch-auth", true).ok();
 
-                    store.set("twitch_access_token", json!(token.access_token));
+    //Connnect to the twitch socket
+    let url = twitch_api::TWITCH_EVENTSUB_WEBSOCKET_URL.clone();
+    let user_id = Arc::new(twitch_token.user_id.clone());
+    let token_mutex = Arc::new(AsyncMutex::new(twitch_token));
+    let subscribed = Arc::new(AtomicBool::new(false));
 
-                    println!("Twitch Token refreshed\n");
+    // get_twitch_data(helix_client, &app, user_id, twitch_token.clone()).await;
 
-                    Box::pin(auth_twitch(app)).await;
-                }
+    let (dummy_tx, _unused_rx) = tokio_mpsc::unbounded_channel::<()>();
 
-                _ => {
-                    app.emit("twitch-auth", false).ok();
-                    println!("Error token auth: {:?}", e);
-                }
-            };
+    let mut handle = SocketHandle::spawn(
+        url.clone(),
+        &helix_client,
+        dummy_tx.clone(),
+        token_mutex.clone(),
+        // opts.clone(),
+        subscribed.clone(),
+        user_id.clone(),
+    );
+
+    let polling_token = token_mutex.clone();
+    let polling_user_id = user_id.clone();
+
+    tokio::spawn(async move {
+        loop {
+            println!("Polling \n");
+            get_twitch_data(helix_client, &app, polling_user_id.as_str(), polling_token.clone())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
         }
+    });
 
-        Ok(twitch_token) => {
-            let helix_client: &'static HelixClient<_> = LazyLock::force(&HELIX_CLIENT);
-            let user_id = twitch_token.user_id.as_str();
-            // let user_id = twitch_token.
-            let access_token = &twitch_token.access_token;
-
-            // twitch_token.refresh_token(&reqwest).await.unwrap();
-
-            // store.set("twitch_access_token", json!(twitch_token.access_token));
-            {
-                let mut state = state_mutex.lock().unwrap();
-                state.is_twitch_auth = true;
-            }
-
-            app.emit("twitch-auth", true).ok();
-
-            //Connnect to the twitch socket
-            let url = twitch_api::TWITCH_EVENTSUB_WEBSOCKET_URL.clone();
-            let user_id = Arc::new(twitch_token.user_id.clone());
-            let token_mutex = Arc::new(AsyncMutex::new(twitch_token));
-            let subscribed = Arc::new(AtomicBool::new(false));
-
-            // get_twitch_data(helix_client, &app, user_id, twitch_token.clone()).await;
-
-            let (dummy_tx, _unused_rx) = tokio_mpsc::unbounded_channel::<()>();
-
-            let mut handle = SocketHandle::spawn(
-                url.clone(),
-                &helix_client,
-                dummy_tx.clone(),
-                token_mutex.clone(),
-                // opts.clone(),
-                subscribed.clone(),
-                user_id.clone(),
-            );
-
-            let polling_token = token_mutex.clone();
-            let polling_user_id = user_id.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    println!("Polling \n");
-                    get_twitch_data(helix_client, &app, polling_user_id.as_str(), polling_token.clone())
-                        .await
-                        .unwrap();
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-                }
-            });
-
-            loop {
-                handle = match handle.join().await.unwrap() {
-                    Ok(handle) => handle,
-                    Err(err) => {
-                        subscribed.store(false, Ordering::Relaxed);
-                        tracing::error!("{err}");
-                        SocketHandle::spawn(
-                            url.clone(),
-                            helix_client,
-                            dummy_tx.clone(),
-                            token_mutex.clone(),
-                            subscribed.clone(),
-                            user_id.clone(),
-                        )
-                    }
-                }
+    loop {
+        handle = match handle.join().await.unwrap() {
+            Ok(handle) => handle,
+            Err(err) => {
+                subscribed.store(false, Ordering::Relaxed);
+                tracing::error!("{err}");
+                SocketHandle::spawn(
+                    url.clone(),
+                    helix_client,
+                    dummy_tx.clone(),
+                    token_mutex.clone(),
+                    subscribed.clone(),
+                    user_id.clone(),
+                )
             }
         }
-    };
+    }
 }
 
 enum TauriDeckEvent {
@@ -1079,8 +1053,6 @@ pub fn run() {
                         button_state: MouseButtonState::Up,
                         ..
                     } => {
-                        println!("left click pressed and released");
-                        // in this example, let's show and focus the main window when the tray is clicked
                         let app = tray.app_handle();
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.unminimize();
@@ -1088,18 +1060,13 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
-                    _ => {
-                        println!("unhandled event {event:?}");
-                    }
+                    _ => {}
                 })
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
-                        println!("quit menu item was clicked");
                         app.exit(0);
                     }
-                    _ => {
-                        println!("menu item {:?} not handled", event.id);
-                    }
+                    _ => {}
                 })
                 .build(app)?;
 
