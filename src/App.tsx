@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import twitchLogo from "./assets/icons/twitch.svg";
 import discordLogo from "./assets/icons/discord.svg";
+import bulbOn from "./assets/icons/bulb-on.png";
+import bulbOff from "./assets/icons/bulb.png";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -16,6 +18,7 @@ type AppState = {
   is_live: boolean,
   is_micro_on: boolean,
   is_twitch_auth: boolean,
+  is_backlight_on: boolean,
   viewers: number
 };
 
@@ -25,13 +28,13 @@ const defaultState: AppState = {
   is_live: false,
   is_micro_on: false,
   is_twitch_auth: false,
+  is_backlight_on: true,
   viewers: 0
 };
 
 function App() {
   let unlisteners: (() => void)[] = [];
 
-  const [isTwitchAuth, setIsTwitchAuth] = useState(false);
   const [appState, setAppState] = useState<AppState>(defaultState);
 
   let isInitRef = useRef(false);
@@ -54,6 +57,11 @@ function App() {
 
   async function handleAuthTwitch() {
     await invoke("auth_twitch");
+    await updateAppState();
+  }
+
+  async function handleToggleBacklight() {
+    await invoke("toggle_backlight");
     await updateAppState();
   }
 
@@ -131,6 +139,18 @@ function App() {
   return (
     <main className="container">
       <h1 className="font-bold">Auth</h1>
+      {appState.is_backlight_on ?
+        <button onClick={handleToggleBacklight} aria-label="Backlight on" className="absolute right-0 top-0 size-20 shadow-none">
+          <img src={bulbOn} className="" alt="Auth Twitch" />
+          {/*<div className="absolute bottom-5 left-4.5 bg-white size-4" />*/}
+          {/*{appState.is_twitch_auth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2" src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}*/}
+        </button>
+        :
+        <button onClick={handleToggleBacklight} aria-label="Backlight off" className="absolute right-0 top-0 size-20 shadow-none! bg-gray-400!">
+          <img src={bulbOff} className="" alt="Auth Twitch" />
+          {/*<div className="absolute bottom-5 left-4.5 bg-white size-4" />*/}
+          {/*{appState.is_twitch_auth ? <img className="absolute bottom-3 left-2" height={"36px"} width={"36px"} src={CheckIcon} alt="Authenticated" /> : <img className="absolute bottom-3 left-2" src={CrossIcon} height={"36px"} width={"36px"} alt="Not Authenticated" />}*/}
+        </button>}
 
       <div className="row gap-10">
         <div className="relative">
